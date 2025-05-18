@@ -1,5 +1,5 @@
 import { createServerFn } from '@tanstack/react-start'
-import { Anthropic } from '@anthropic-ai/sdk'
+import { GoogleGenerativeAI } from '@google/generative-ai'
 
 export interface Message {
   id: string
@@ -49,7 +49,6 @@ const DEFAULT_SYSTEM_PROMPT = `You are TanStack Chat, an AI assistant using Mark
 
 Keep responses concise and well-structured. Use appropriate Markdown formatting to enhance readability and understanding.`
 
-// Non-streaming implementation
 export const genAIResponse = createServerFn({ method: 'GET', response: 'raw' })
   .validator(
     (d: {
@@ -57,23 +56,19 @@ export const genAIResponse = createServerFn({ method: 'GET', response: 'raw' })
       systemPrompt?: { value: string; enabled: boolean }
     }) => d,
   )
-  // .middleware([loggingMiddleware])
   .handler(async ({ data }) => {
     // Check for API key in environment variables
-    const apiKey = process.env.ANTHROPIC_API_KEY || import.meta.env.VITE_ANTHROPIC_API_KEY
+    const apiKey = process.env.GOOGLE_API_KEY || import.meta.env.VITE_GOOGLE_API_KEY
 
     if (!apiKey) {
       throw new Error(
-        'Missing API key: Please set VITE_ANTHROPIC_API_KEY in your environment variables or VITE_ANTHROPIC_API_KEY in your .env file.'
+        'Missing API key: Please set VITE_GOOGLE_API_KEY in your environment variables.'
       )
     }
-    
-    // Create Anthropic client with proper configuration
-    const anthropic = new Anthropic({
-      apiKey,
-      // Add proper timeout to avoid connection issues
-      timeout: 30000 // 30 seconds timeout
-    })
+
+    // Initialize the Gemini API
+    const genAI = new GoogleGenerativeAI(apiKey)
+    const model = genAI.getGenerativeModel({ model: 'gemini-pro' })
 
     // Filter out error messages and empty messages
     const formattedMessages = data.messages
@@ -84,7 +79,7 @@ export const genAIResponse = createServerFn({ method: 'GET', response: 'raw' })
       )
       .map((msg) => ({
         role: msg.role,
-        content: msg.content.trim(),
+        parts: msg.content.trim(),
       }))
 
     if (formattedMessages.length === 0) {
@@ -98,38 +93,55 @@ export const genAIResponse = createServerFn({ method: 'GET', response: 'raw' })
       ? `${DEFAULT_SYSTEM_PROMPT}\n\n${data.systemPrompt.value}`
       : DEFAULT_SYSTEM_PROMPT
 
-    // Debug log to verify prompt layering
-    console.log('System Prompt Configuration:', {
-      hasCustomPrompt: data.systemPrompt?.enabled,
-      customPromptValue: data.systemPrompt?.value,
-      finalPrompt: systemPrompt,
-    })
-
     try {
-      const response = await anthropic.messages.stream({
-        model: 'claude-3-5-sonnet-20241022',
-        max_tokens: 4096,
-        system: systemPrompt,
-        messages: formattedMessages,
+      // Start a new chat
+      const chat = model.startChat({
+        history: formattedMessages.slice(0, -1).map(msg => ({
+          role: msg.role,
+          parts: msg.parts,
+        })),
+        generationConfig: {
+          maxOutputTokens: 4096,
+        },
       })
 
-      return new Response(response.toReadableStream())
+      // Get the response stream
+      const result = await chat.sendMessageStream(formattedMessages[formattedMessages.length - 1].parts)
+
+      // Create a TransformStream to handle the streaming response
+      const stream = new TransformStream({
+        async transform(chunk, controller) {
+          const text = chunk.text()
+          controller.enqueue(
+            new TextEncoder().encode(
+              JSON.stringify({
+                type: 'content_block_delta',
+                delta: { text },
+              }) + '\n'
+            )
+          )
+        },
+      })
+
+      // Pipe the response through our transform stream
+      result.stream().pipeThrough(stream)
+
+      return new Response(stream.readable)
     } catch (error) {
       console.error('Error in genAIResponse:', error)
       
-      // Error handling with specific messages
       let errorMessage = 'Failed to get AI response'
       let statusCode = 500
       
       if (error instanceof Error) {
-        if (error.message.includes('rate limit')) {
-          errorMessage = 'Rate limit exceeded. Please try again in a moment.'
-        } else if (error.message.includes('Connection error') || error.name === 'APIConnectionError') {
-          errorMessage = 'Connection to Anthropic API failed. Please check your internet connection and API key.'
-          statusCode = 503 // Service Unavailable
-        } else if (error.message.includes('authentication')) {
-          errorMessage = 'Authentication failed. Please check your Anthropic API key.'
-          statusCode = 401 // Unauthorized
+        if (error.message.includes('quota')) {
+          errorMessage = 'API quota exceeded. Please try again later.'
+        } else if (error.message.includes('network')) {
+          errorMessage = 'Network error occurred. Please check your internet connection.'
+          statusCode = 503
+        } else if (error.message.includes('key')) {
+          errorMessage = 'Invalid API key. Please check your Google API key.'
+          statusCode = 401
         } else {
           errorMessage = error.message
         }
@@ -143,4 +155,4 @@ export const genAIResponse = createServerFn({ method: 'GET', response: 'raw' })
         headers: { 'Content-Type': 'application/json' },
       })
     }
-  }) 
+  })
